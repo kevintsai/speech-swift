@@ -232,19 +232,55 @@ public class SineGenerator {
     let sineAmp: Float
     let noiseStd: Float
     let voicedThreshold: Float
+    let upsampleScale: Int    // = prod(upsampleRates) * istftHopLen (= 480). Python SineGen2.upsample_scale.
 
     public init(
         sampleRate: Int = 24000,
+        upsampleScale: Int,
         harmonicNum: Int = 8,
         sineAmp: Float = 0.1,
         noiseStd: Float = 0.003,
         voicedThreshold: Float = 10.0
     ) {
         self.sampleRate = sampleRate
+        self.upsampleScale = upsampleScale
         self.harmonicNum = harmonicNum
         self.sineAmp = sineAmp
         self.noiseStd = noiseStd
         self.voicedThreshold = voicedThreshold
+    }
+
+    // PyTorch F.interpolate(align_corners=False) linear resample along axis 1: [B,T,C] -> [B,newT,C].
+    // Port of Python mlx_audio `linear_interpolate_1d`.
+    private func linearInterpolate1d(_ x: MLXArray, newT: Int) -> MLXArray {
+        let T = x.dim(1)
+        let nt = Swift.max(1, newT)
+        let ar = MLXArray((0..<nt).map { Float($0) })
+        var indices = (ar + MLXArray(Float(0.5))) * MLXArray(Float(T) / Float(nt)) - MLXArray(Float(0.5))
+        indices = minimum(maximum(indices, MLXArray(Float(0.0))), MLXArray(Float(T) - Float(1.001)))
+        let idxLow = floor(indices).asType(.int32)
+        let idxHigh = minimum(idxLow + MLXArray(Int32(1)), MLXArray(Int32(T - 1)))
+        let wHigh = indices - idxLow.asType(.float32)
+        let wLow = MLXArray(Float(1.0)) - wHigh
+        let lowVals = x.take(idxLow, axis: 1)     // [B, nt, C]
+        let highVals = x.take(idxHigh, axis: 1)   // [B, nt, C]
+        return lowVals * wLow.reshaped([1, nt, 1]) + highVals * wHigh.reshaped([1, nt, 1])
+    }
+
+    /// Port of Python mlx_audio `SineGen2._f02sine`: STAIRCASE phase.
+    /// Downsample rad by 1/upsampleScale → cumsum at low (mel) rate → repeat (nearest) back up →
+    /// ×upsampleScale. This is deliberately NOT a full-rate cumsum: it matches the known-good
+    /// Python path. A full-rate cumsum (previous Swift impl) injects a strong OOD harmonic source
+    /// that drives the trained tanh source-merge into saturation → the "reverb/breath" artifact.
+    private func f02sine(_ f0Values: MLXArray) -> MLXArray {
+        let T = f0Values.dim(1)
+        let radValues = f0Values / MLXArray(Float(sampleRate))   // %1 unnecessary (sin is 2π-periodic)
+        let radDown = linearInterpolate1d(radValues, newT: T / upsampleScale)
+        var phase = cumsum(radDown, axis: 1) * MLXArray(Float(2.0 * Float.pi))
+        phase = repeated(phase, count: upsampleScale, axis: 1)
+        phase = phase * MLXArray(Float(upsampleScale))
+        phase = phase[0..., 0..<T, 0...]
+        return sin(phase)
     }
 
     /// Generate sine waves and voiced/unvoiced mask from F0.
@@ -253,38 +289,24 @@ public class SineGenerator {
     public func callAsFunction(_ f0: MLXArray) -> (MLXArray, MLXArray) {
         let totalHarmonics = harmonicNum + 1  // fundamental + overtones
 
-        // Create harmonic multipliers: [1, 2, 3, ..., totalHarmonics]
+        // Harmonic multipliers [1..H]; fn = f0 * harmonics (Python __call__).
         let harmonics = MLXArray(Array(1...totalHarmonics).map { Float($0) })
             .reshaped([1, 1, totalHarmonics])  // [1, 1, H]
+        let fn = f0 * harmonics                // [B, T, H]
 
-        // f0: [B, T, 1] -> frequencies: [B, T, H]
-        let frequencies = (f0 * harmonics) / Float(sampleRate)
+        // Staircase sine (matches Python), scaled by sineAmp.
+        let sines = f02sine(fn) * MLXArray(sineAmp)   // [B, T, H]
 
-        // Voiced mask: f0 > threshold -> 1.0, else 0.0
+        // Voiced mask from f0 (not fn): [B, T, 1]
         let uvMask = MLX.where(
             f0 .> MLXArray(voicedThreshold),
             MLXArray(Float(1.0)),
             MLXArray(Float(0.0)))
 
-        // Zero out unvoiced regions before cumsum to prevent phase drift
-        let maskedFreqs = frequencies * uvMask  // [B, T, H]
-
-        // Phase: 2*pi * cumsum(freq) along time axis
-        let phase = cumsum(maskedFreqs, axis: 1) * MLXArray(Float(2.0 * Float.pi))
-
-        // Add random initial phase offset to avoid artifacts at boundaries
-        let initPhase = MLXRandom.uniform(
-            low: 0,
-            high: Float(2.0 * Float.pi),
-            [f0.dim(0), 1, totalHarmonics])
-        let fullPhase = phase + initPhase
-
-        // Generate sine waves
-        var sineWaves = MLXArray(sineAmp) * sin(fullPhase)  // [B, T, H]
-
-        // Apply voiced mask: voiced -> sine, unvoiced -> noise
-        let noise = MLXRandom.normal(sineWaves.shape) * MLXArray(noiseStd)
-        sineWaves = sineWaves * uvMask + noise * (1.0 - uvMask)
+        // Python noise: voiced adds uv*noise_std, unvoiced adds sine_amp/3; then sine*uv + noise.
+        let noiseAmp = uvMask * MLXArray(noiseStd) + (MLXArray(Float(1.0)) - uvMask) * MLXArray(sineAmp / 3.0)
+        let noise = noiseAmp * MLXRandom.normal(sines.shape)
+        let sineWaves = sines * uvMask + noise  // [B, T, H]
 
         return (sineWaves, uvMask)
     }
@@ -301,6 +323,7 @@ public class SourceModuleHnNSF: Module {
 
     public init(
         sampleRate: Int = 24000,
+        upsampleScale: Int,
         harmonicNum: Int = 8,
         sineAmp: Float = 0.1,
         noiseStd: Float = 0.003,
@@ -308,6 +331,7 @@ public class SourceModuleHnNSF: Module {
     ) {
         self.sineGen = SineGenerator(
             sampleRate: sampleRate,
+            upsampleScale: upsampleScale,
             harmonicNum: harmonicNum,
             sineAmp: sineAmp,
             noiseStd: noiseStd,
@@ -322,9 +346,10 @@ public class SourceModuleHnNSF: Module {
     /// - Returns: excitation signal [B, T, 1]
     public func callAsFunction(_ f0: MLXArray) -> MLXArray {
         let (sineWaves, _) = sineGen(f0)  // [B, T, H]
-        let merged = tanh(linearMerge(sineWaves))  // [B, T, 1]
-        let noise = MLXRandom.normal(merged.shape) * MLXArray(noiseStd)
-        return merged + noise
+        // Python SourceModuleHnNSF2 returns tanh(l_linear(sine)) as the source `s`; its extra
+        // noise is returned separately and DISCARDED by the caller. Swift previously ADDED that
+        // noise → extra broadband source. Match Python: return the merged sine only.
+        return tanh(linearMerge(sineWaves))  // [B, T, 1]
     }
 }
 
@@ -661,6 +686,7 @@ public class HiFiGANGenerator: Module {
         // Source module
         self._source.wrappedValue = SourceModuleHnNSF(
             sampleRate: config.sampleRate,
+            upsampleScale: config.totalUpsampleFactor * config.istftHopLen,  // 8*5*3*4 = 480
             harmonicNum: config.nbHarmonics,
             sineAmp: config.nsfAlpha,
             noiseStd: config.nsfSigma,

@@ -489,10 +489,10 @@ public class CosyVoiceLLM: Module {
         let (prefillLogits, cache) = forwardStep(prefixEmbeds, offset: offset, cache: nil)
         eval(prefillLogits, cache)
 
-        // Suppress the trailing speech-vocab range (post-stop padding rows).
-        // The three stop tokens themselves stay live so the LLM can signal end.
-        let suppressStart = config.speechTokenSize  // 6561
-        let suppressEnd = config.totalSpeechVocabSize  // 6761
+        // NO tail suppression: Python mlx_audio suppresses nothing outside the min-len EOS
+        // mask. The whole 6561..6760 range is now legit stop tokens (see Configuration.stopTokens),
+        // so suppressing them forced the model past its intended end-of-speech → choppy tail.
+        // Passing suppressRange:nil below (was (speechTokenSize, totalSpeechVocabSize)).
 
         // Min length: scale to content text length, not the full
         // instruction+content prefix. Upstream: min_len = content_len * ratio.
@@ -503,7 +503,7 @@ public class CosyVoiceLLM: Module {
             logits: prefillLogits[0..., (prefixLen - 1)..<prefixLen, 0...],
             topK: sampling.topK,
             topP: sampling.topP,
-            suppressRange: (suppressStart, suppressEnd),
+            suppressRange: nil,
             stopTokens: stopTokens,
             ignoreEos: true,  // always ignore stop tokens for first token
             rasWinSize: sampling.winSize,
@@ -534,7 +534,7 @@ public class CosyVoiceLLM: Module {
                 topK: sampling.topK,
                 topP: sampling.topP,
                 generatedTokens: generatedTokens,
-                suppressRange: (suppressStart, suppressEnd),
+                suppressRange: nil,
                 stopTokens: stopTokens,
                 ignoreEos: belowMinLen,
                 rasWinSize: sampling.winSize,

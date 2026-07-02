@@ -27,14 +27,16 @@ public struct CosyVoiceLLMConfig: Codable, Sendable {
     public var fillToken: Int { speechTokenSize + 3 }
 
     /// Stop tokens recognised by the LLM during autoregressive generation.
-    /// Upstream's `Qwen2LM` (which `CosyVoice3LM` inherits) defines
-    ///   `stop_token_ids = [speech_token_size + i for i in range(3)]`
-    /// so EOS, "stop_1", and "fill" all break the generation loop. Our port
-    /// previously only broke on eosToken, forcing the LLM to keep generating
-    /// when it wanted to stop via either of the other two — observable as
-    /// per-segment repetitions in long-form synthesis.
+    /// **CosyVoice3** (not CosyVoice2) treats the ENTIRE extended vocab as terminal:
+    /// Python mlx_audio `llm.py` → `stop_token_ids = [speech_token_size + i for i in
+    /// range(extended_vocab_size)]` = all 200 tokens 6561..6760. The earlier 3-token
+    /// set (copied from CosyVoice2's `range(3)`) let the model want-to-stop via any of
+    /// the other 197 tokens but never break → it ran to the maxTokens cap emitting an
+    /// off-distribution choppy/bursty tail (short sentence → 8 s of garbage). Widening
+    /// to the full range also neutralises any tail-suppression (every token here is now
+    /// a legit stop), matching Python which suppresses nothing outside the min-len EOS mask.
     public var stopTokens: [Int] {
-        [speechTokenSize, speechTokenSize + 1, speechTokenSize + 2]
+        Array(speechTokenSize..<totalSpeechVocabSize)
     }
 
     public init() {}

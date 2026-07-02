@@ -128,6 +128,12 @@ public class ConditionalFlowMatching: Module {
         cond: MLXArray? = nil
     ) -> MLXArray {
         // 1. Sample initial noise: z ~ N(0, temperature^2 * I)
+        // DETERMINISTIC noise to match Python mlx_audio flow.py: it reseeds to a FIXED value
+        // (mx.random.seed(0)) before every inference so the initial ODE noise is the SAME
+        // realization each call → stable timbre. Swift previously drew fresh unseeded noise
+        // every call → timbre drift / quality gap vs the known-good Python path. Noise still
+        // varies with N (mel length): seed(0)+normal(B,80,N), exactly like Python.
+        MLXRandom.seed(0)
         let z = MLXRandom.normal(mu.shape).asType(mu.dtype) * MLXArray(temperature)
 
         // 2. Create time schedule with cosine mapping

@@ -260,6 +260,10 @@ public final class CosyVoiceTTSModel {
         //    length separately (without the instruction frame) so the LLM's
         //    min/max-len constraints scale to the actual content, not the
         //    instruction. Upstream: `min_len = (text_len - prompt_text_len) * ratio`.
+        // Text frontend normalization (port of Python mlx_audio _normalize_text): zh punctuation,
+        // blank handling, corner marks, bracket removal, trailing-comma→。; English digit spell-out.
+        // Absent in the Swift port → pacing/punctuation gap vs the known-good Python path.
+        let text = Self.normalizeText(text)
         let contentTokens = tokenizer.encode(text).map { Int32($0) }
 
         // For an unstyled zero-shot clone, upstream's text input is literally
@@ -280,8 +284,21 @@ public final class CosyVoiceTTSModel {
         if useInstructionConditionedClone {
             textTokens = tokenizeText(text, language: language, instruction: instruction)
         } else if let pt = promptText, !pt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // Match Python mlx_audio zero-shot layout EXACTLY:
+            //   [ "You are a helpful assistant." ] [ <|endofprompt|> ] [ ref_transcript ] [ target ]
+            // i.e. ZERO_SHOT_PROMPT_PREFIX = SYSTEM_PROMPT + <|endofprompt|>, then
+            // concat(prompt_text = prefix+ref_transcript, target_text). The system frame MUST
+            // precede <|endofprompt|>, and the ref transcript sits in the CONTENT region adjacent
+            // to the target with NO separator. The appended reference speech (FSQ) tokens then act
+            // as that transcript's acoustic prefix, so the model resumes at `target` and does NOT
+            // re-vocalise the transcript.
+            // The old layout `[ref_transcript] <|endofprompt|> [target]` (missing system frame,
+            // <|endofprompt|> between transcript and target) pushed the transcript into the
+            // instruction region → the acoustic prefix misaligned → the reference transcript got
+            // spoken before the reply (short sentence 8.0 s vs 2.0 s). See tools cosy-diag.
+            let systemTokens = tokenizer.encode(Self.assistantPrefix).map { Int32($0) }
             let promptTextTokens = tokenizer.encode(pt).map { Int32($0) }
-            textTokens = promptTextTokens + [Self.endOfPromptToken] + contentTokens
+            textTokens = systemTokens + [Self.endOfPromptToken] + promptTextTokens + contentTokens
         } else {
             textTokens = tokenizeText(text, language: language, instruction: instruction)
         }
@@ -480,5 +497,105 @@ public final class CosyVoiceTTSModel {
         let instructionTokens = tokenizer.encode(Self.framedInstruction(instruction)).map { Int32($0) }
         let textTokens = tokenizer.encode(text).map { Int32($0) }
         return instructionTokens + [Self.endOfPromptToken] + textTokens
+    }
+
+    // MARK: - Text normalization (port of Python mlx_audio cosyvoice3 `_normalize_text`)
+
+    /// Lightweight frontend normalization matching the known-good Python path
+    /// (cosyvoice3.py:1101-1126). No wetext/ttsfrd. Control-tag strings pass through.
+    static func normalizeText(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return trimmed }
+        if trimmed.contains("<|") && trimmed.contains("|>") { return trimmed }  // control-tag bypass
+
+        if containsChinese(trimmed) {
+            var s = trimmed.replacingOccurrences(of: "\n", with: "")
+            s = replaceBlank(s)
+            s = s.replacingOccurrences(of: "²", with: "平方")
+                 .replacingOccurrences(of: "³", with: "立方")
+            s = s.replacingOccurrences(of: ".", with: "。")
+            s = s.replacingOccurrences(of: " - ", with: "，")
+            s = removeBracket(s)
+            s = trailingSeparatorToPeriod(s)
+            return s
+        }
+        return spellOutNumber(trimmed)
+    }
+
+    static func containsChinese(_ s: String) -> Bool {
+        s.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
+    }
+
+    /// Drop spaces except a single space kept between two adjacent ASCII (non-space) chars.
+    static func replaceBlank(_ text: String) -> String {
+        let chars = Array(text)
+        var out = ""
+        for (i, ch) in chars.enumerated() {
+            if ch != " " { out.append(ch); continue }
+            if i == 0 || i == chars.count - 1 { continue }
+            let prev = chars[i - 1], next = chars[i + 1]
+            if prev.isASCII && prev != " " && next.isASCII && next != " " { out.append(ch) }
+        }
+        return out
+    }
+
+    static func removeBracket(_ text: String) -> String {
+        var s = text
+        for b in ["（", "）", "【", "】", "`"] { s = s.replacingOccurrences(of: b, with: "") }
+        return s.replacingOccurrences(of: "——", with: " ")
+    }
+
+    /// Python: re.sub(r"[，,、]+$", "。", text) — a trailing run of those separators → single 。
+    static func trailingSeparatorToPeriod(_ text: String) -> String {
+        var s = text
+        var stripped = false
+        while let last = s.last, last == "，" || last == "," || last == "、" { s.removeLast(); stripped = true }
+        if stripped { s.append("。") }
+        return s
+    }
+
+    /// Spell out ASCII digit runs as English cardinal words (Python `_spell_out_number` via num2words).
+    static func spellOutNumber(_ text: String) -> String {
+        var out = "", digits = ""
+        func flush() {
+            if !digits.isEmpty {
+                out += Int(digits).map { englishCardinal($0) } ?? digits
+                digits = ""
+            }
+        }
+        for ch in text {
+            if ch.isASCII && ch.isNumber { digits.append(ch) } else { flush(); out.append(ch) }
+        }
+        flush()
+        return out
+    }
+
+    static func englishCardinal(_ n: Int) -> String {
+        if n == 0 { return "zero" }
+        if n < 0 { return "minus " + englishCardinal(-n) }
+        let ones = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+                    "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+                    "eighteen", "nineteen"]
+        let tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+        func below1000(_ v: Int) -> String {
+            var parts: [String] = []
+            let h = v / 100, r = v % 100
+            if h > 0 { parts.append(ones[h] + " hundred") }
+            if r > 0 {
+                if r < 20 { parts.append(ones[r]) }
+                else {
+                    let t = tens[r / 10]
+                    parts.append(r % 10 == 0 ? t : t + "-" + ones[r % 10])
+                }
+            }
+            return parts.joined(separator: " ")
+        }
+        var rem = n
+        var parts: [String] = []
+        for (val, name) in [(1_000_000_000, "billion"), (1_000_000, "million"), (1000, "thousand")] {
+            if rem >= val { parts.append(below1000(rem / val) + " " + name); rem %= val }
+        }
+        if rem > 0 { parts.append(below1000(rem)) }
+        return parts.joined(separator: " ")
     }
 }

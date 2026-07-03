@@ -958,7 +958,7 @@ public class Qwen3TTSModel {
     /// Text-derived generation cap shared by single, streaming, clone, and batch paths.
     /// At 12.5 Hz, six codec frames per text token leaves margin for slow speech while
     /// preventing short prompts from running to the generic safety limit when EOS is weak.
-    private func maxTokenCap(
+    func maxTokenCap(
         for texts: [String],
         tokenizer: Qwen3Tokenizer,
         sampling: SamplingConfig
@@ -1154,7 +1154,7 @@ public class Qwen3TTSModel {
     /// The compiled path fuses ~420 Metal kernel dispatches (28 layers × ~15 ops) into
     /// fewer optimized kernels. Uses shapeless=true to handle growing KV cache without
     /// recompilation. RoPE offset is passed as a regular MLXArray input (not baked).
-    private func executeTalkerStep(
+    func executeTalkerStep(
         embeds: MLXArray, offset: Int, cache: [(MLXArray, MLXArray)]
     ) -> (MLXArray, MLXArray, [(MLXArray, MLXArray)]) {
         guard let compiled = compiledTalkerStep else {
@@ -1562,7 +1562,7 @@ public class Qwen3TTSModel {
     /// Uses lazy evaluation: all 15 groups are chained as a single MLX computation graph
     /// with zero GPU sync barriers. One `eval()` at the end materializes all tokens.
     /// This reduces per-step GPU syncs from 15 to 1.
-    private func predictCodebooksForTimestep(
+    func predictCodebooksForTimestep(
         hiddenState: MLXArray,
         firstCodebookToken: Int32,
         cpSamplingConfig: SamplingConfig

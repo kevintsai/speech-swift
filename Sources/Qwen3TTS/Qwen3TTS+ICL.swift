@@ -231,7 +231,7 @@ extension Qwen3TTSModel {
     /// [ref_text + target_text + tts_eos + codec_pad]  ← text overlay
     /// [codec_bos + ref_codec_embeds]                  ← codec ICL context
     /// ```
-    private func buildICLPrefillEmbeddings(
+    func buildICLPrefillEmbeddings(
         refCodes: MLXArray,         // [1, 16, T_ref]
         referenceText: String,
         targetText: String,

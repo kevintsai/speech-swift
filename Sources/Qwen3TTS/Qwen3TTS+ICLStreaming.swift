@@ -179,11 +179,14 @@ extension Qwen3TTSModel {
         var nextEmitThreshold = streaming.firstChunkFrames
 
         // Decode [start, end) target frames with reference codec as left-context; yield only target audio.
+        // The FINAL chunk gets right-context tail-pad so the causal vocoder renders the last syllable's
+        // tail cleanly (otherwise the last word/字 gets pitch wobble / noise / cut — worst on English).
         func emit(_ start: Int, _ end: Int, isFinal: Bool) {
             let chunk = decodeICLStreamChunk(
                 refCodebooks: refCodebooks, targetCodebooks: generatedAllCodebooks,
                 chunkStart: start, chunkEnd: end,
-                decoderLeftContext: streaming.decoderLeftContext, samplesPerFrame: samplesPerFrame)
+                decoderLeftContext: streaming.decoderLeftContext, samplesPerFrame: samplesPerFrame,
+                tailPadFrames: isFinal ? 3 : 0)
             continuation.yield(AudioChunk(samples: chunk, sampleRate: 24000, frameIndex: start,
                                           isFinal: isFinal, elapsedTime: CFAbsoluteTimeGetCurrent() - t0))
         }
@@ -266,7 +269,8 @@ extension Qwen3TTSModel {
         chunkStart: Int,
         chunkEnd: Int,
         decoderLeftContext: Int,
-        samplesPerFrame: Int
+        samplesPerFrame: Int,
+        tailPadFrames: Int = 0
     ) -> [Float] {
         let numGroups = targetCodebooks.count
         let refCount = refCodebooks.first?.count ?? 0
@@ -281,11 +285,17 @@ extension Qwen3TTSModel {
         codebookArrays.reserveCapacity(numGroups)
         for g in 0..<numGroups {
             var slice: [Int32] = []
-            slice.reserveCapacity(refCtxFrames + (chunkEnd - tgtCtxStart))
+            slice.reserveCapacity(refCtxFrames + (chunkEnd - tgtCtxStart) + tailPadFrames)
             if refCtxFrames > 0 {
                 slice.append(contentsOf: refCodebooks[g][(refCount - refCtxFrames)..<refCount])
             }
             slice.append(contentsOf: targetCodebooks[g][tgtCtxStart..<chunkEnd])
+            // Right-context: repeat the last real frame so the causal Mimi decoder has look-ahead
+            // and renders the final syllable's tail cleanly. These padded samples are dropped below.
+            if tailPadFrames > 0, chunkEnd > 0 {
+                let last = targetCodebooks[g][chunkEnd - 1]
+                slice.append(contentsOf: Array(repeating: last, count: tailPadFrames))
+            }
             codebookArrays.append(MLXArray(slice).expandedDimensions(axis: 0))  // [1, T]
         }
         var codes = stacked(codebookArrays, axis: 1)  // [1, numGroups, T]
@@ -301,12 +311,14 @@ extension Qwen3TTSModel {
 
         let waveform = codecDecoder.executeDecoder(codes)  // [1, T_samples, 1]
 
-        // Keep only the target chunk: the last realChunkFrames * samplesPerFrame samples.
-        // Everything to the left (reference + earlier-target context + startup warmup) is dropped.
+        // Keep only the target chunk. Drop the tail-pad's samples from the right (it existed only to
+        // give the last real frame right-context), then keep the last realChunkFrames*samplesPerFrame
+        // samples of what remains (keeping from the right absorbs the decoder's left-side warmup).
         let expectedKept = realChunkFrames * samplesPerFrame
         let totalSamples = waveform.dim(1)
-        let trimSamples = max(0, totalSamples - expectedKept)
-        let kept = waveform[0..., trimSamples..<totalSamples, 0...]
+        let end = max(0, totalSamples - tailPadFrames * samplesPerFrame)
+        let start = max(0, end - expectedKept)
+        let kept = waveform[0..., start..<end, 0...]
         let flat = kept.squeezed()
         eval(flat)
         return flat.asArray(Float.self)

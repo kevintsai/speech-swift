@@ -330,6 +330,57 @@ public class Qwen3TTSModel {
         }
     }
 
+    /// Streaming x-vector-only voice clone: timbre comes solely from the reference's
+    /// speaker embedding — the reference audio's codec tokens / transcript never enter
+    /// the AR context (unlike ICL). Trades some prosody similarity for cleaner starts
+    /// and robustness to reference quality / language switching (HF speech-to-speech
+    /// `qwen3_tts_xvec_only` recommends this mode for exactly those cases). No codec
+    /// encoder needed — cheaper prefill than ICL.
+    ///
+    /// - Parameters mirror `synthesizeStreamWithVoiceCloneICL` minus `referenceText` /
+    ///   `codecEncoder`(xvec 模式用不到)。`language` 支援 "auto"(nothink layout)。
+    public func synthesizeStreamWithVoiceCloneXVec(
+        text: String,
+        referenceAudio: [Float],
+        referenceSampleRate: Int = 24000,
+        language: String = "auto",
+        sampling: SamplingConfig = .default,
+        streaming: StreamingConfig = .default
+    ) -> AsyncThrowingStream<AudioChunk, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    // Speaker embedding(依參考音檔快取)— 與 ICL / blocking clone 同一條抽取路徑。
+                    let speakerEmbed: MLXArray
+                    if let cached = self.referenceAudioCache.speakerEmbed(
+                        for: referenceAudio, sampleRate: referenceSampleRate) {
+                        speakerEmbed = cached
+                    } else {
+                        let mels = SpeakerMel.compute(audio: referenceAudio, sampleRate: referenceSampleRate)
+                        let embed = self.speakerEncoder(mels)
+                        eval(embed)
+                        self.referenceAudioCache.storeSpeakerEmbed(
+                            embed, audio: referenceAudio, sampleRate: referenceSampleRate)
+                        speakerEmbed = embed
+                    }
+                    try self.runStreamingGeneration(
+                        text: text,
+                        language: language,
+                        speaker: nil,
+                        instruct: nil,
+                        sampling: sampling,
+                        streaming: streaming,
+                        speakerEmbedding: speakerEmbed,
+                        continuation: continuation)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
+        }
+    }
+
     /// Internal streaming generation loop. Same structure as `synthesize()` but emits audio
     /// chunks via the continuation as soon as enough frames are accumulated.
     private func runStreamingGeneration(
@@ -340,33 +391,78 @@ public class Qwen3TTSModel {
         sampling: SamplingConfig,
         streaming: StreamingConfig,
         languageExplicit: Bool = false,
+        // 非 nil = x-vector-only 語音克隆(streaming):音色只來自 speaker embedding,
+        // 參考音訊的 codec token / 逐字稿不進 AR context(對照 ICL)。此時忽略
+        // speaker / instruct(clone 模式無 CustomVoice speaker token、無 instruct),
+        // language 支援 "auto"(nothink layout,對齊 ICL)。
+        speakerEmbedding: MLXArray? = nil,
         continuation: AsyncThrowingStream<AudioChunk, Error>.Continuation
     ) throws {
         guard let tokenizer = tokenizer else {
             throw TTSError.tokenizerNotLoaded
         }
 
-        let (speakerTokenId, effectiveLanguage) = resolveSpeaker(speaker, language: language, languageExplicit: languageExplicit)
-
-        // Auto-apply default instruct for CustomVoice when none provided
-        let effectiveInstruct = instruct ?? (speakerConfig != nil ? Self.defaultInstruct : nil)
-
-        guard let langId = CodecTokens.languageId(for: effectiveLanguage) else {
-            throw TTSError.unknownLanguage(effectiveLanguage)
-        }
-
         let t0 = CFAbsoluteTimeGetCurrent()
         var cappedSampling = sampling
-        cappedSampling.maxTokens = maxTokenCap(for: [text], tokenizer: tokenizer, sampling: sampling)
-        let safeMaxTokens = cappedSampling.maxTokens
         let samplesPerFrame = 1920  // 24000 / 12.5
 
-        // Stage 1: Prepare embeddings (identical to synthesize)
+        // Stage 1: Prepare embeddings
         let textTokens = prepareTextTokens(text: text, tokenizer: tokenizer)
-        let codecPrefixTokens = buildCodecPrefix(languageId: langId, speakerTokenId: speakerTokenId)
-        let instructTokens = effectiveInstruct.map { prepareInstructTokens(instruct: $0, tokenizer: tokenizer) }
-        let (prefillEmbeds, trailingTextHidden, ttsPadEmbed) = buildPrefillEmbeddings(
-            textTokens: textTokens, codecPrefixTokens: codecPrefixTokens, instructTokens: instructTokens)
+        let prefillEmbeds: MLXArray
+        let trailingTextHidden: MLXArray
+        let ttsPadEmbed: MLXArray
+        if let spkEmbed = speakerEmbedding {
+            // x-vector clone:prompt layout 對齊 blocking synthesizeWithVoiceClone +
+            // ICL prefill part 6 的兩種 codec prefix(有 lang id = think / auto = nothink)。
+            let langId: Int? = {
+                let normalized = language.lowercased()
+                if normalized == "auto" || normalized.isEmpty { return nil }
+                return CodecTokens.languageId(for: language)  // unknown → auto,不 fail
+            }()
+            let codecPrefixTokens: [Int32]
+            let speakerInjectIndex: Int
+            if let langId = langId {
+                codecPrefixTokens = [
+                    Int32(CodecTokens.codecThink),
+                    Int32(CodecTokens.codecThinkBos),
+                    Int32(langId),
+                    Int32(CodecTokens.codecThinkEos),
+                    Int32(CodecTokens.codecPad),
+                    Int32(CodecTokens.codecBos),
+                ]
+                speakerInjectIndex = 4
+            } else {
+                codecPrefixTokens = [
+                    Int32(CodecTokens.codecNothink),
+                    Int32(CodecTokens.codecThinkBos),
+                    Int32(CodecTokens.codecThinkEos),
+                    Int32(CodecTokens.codecPad),
+                    Int32(CodecTokens.codecBos),
+                ]
+                speakerInjectIndex = 3
+            }
+            (prefillEmbeds, trailingTextHidden, ttsPadEmbed) = buildPrefillEmbeddings(
+                textTokens: textTokens, codecPrefixTokens: codecPrefixTokens,
+                speakerEmbedding: spkEmbed, speakerInjectIndex: speakerInjectIndex)
+            // Clone 路徑用 duration-based cap(見 cloneTokenCap:防 under-EOS runaway)。
+            cappedSampling.maxTokens = Self.cloneTokenCap(for: text, sampling: sampling)
+        } else {
+            let (speakerTokenId, effectiveLanguage) = resolveSpeaker(
+                speaker, language: language, languageExplicit: languageExplicit)
+
+            // Auto-apply default instruct for CustomVoice when none provided
+            let effectiveInstruct = instruct ?? (speakerConfig != nil ? Self.defaultInstruct : nil)
+
+            guard let langId = CodecTokens.languageId(for: effectiveLanguage) else {
+                throw TTSError.unknownLanguage(effectiveLanguage)
+            }
+            let codecPrefixTokens = buildCodecPrefix(languageId: langId, speakerTokenId: speakerTokenId)
+            let instructTokens = effectiveInstruct.map { prepareInstructTokens(instruct: $0, tokenizer: tokenizer) }
+            (prefillEmbeds, trailingTextHidden, ttsPadEmbed) = buildPrefillEmbeddings(
+                textTokens: textTokens, codecPrefixTokens: codecPrefixTokens, instructTokens: instructTokens)
+            cappedSampling.maxTokens = maxTokenCap(for: [text], tokenizer: tokenizer, sampling: sampling)
+        }
+        let safeMaxTokens = cappedSampling.maxTokens
         eval(prefillEmbeds, trailingTextHidden, ttsPadEmbed)
 
         // Stage 2: Autoregressive generation with chunked decode + emit
@@ -967,6 +1063,63 @@ public class Qwen3TTSModel {
         return min(sampling.maxTokens, max(75, maxTextTokens * 6))
     }
 
+    /// Duration-based generation cap for the voice-clone paths (ICL blocking/streaming +
+    /// x-vector streaming). Port of HF speech-to-speech `_estimate_max_new_tokens`:
+    /// estimate natural speech seconds from the text — max(words/2.6, chars/14) +
+    /// 0.5 s per punctuation mark + 1 s base — then convert to codec frames (12.5/s)
+    /// with a 1.35× safety margin.
+    ///
+    /// Why this replaces the per-BPE-token ×6/×8 caps on clone paths: for Chinese those
+    /// allow ~5–7× natural speech rate (a BPE token ≈ one hanzi ≈ 1/14 s of speech, but
+    /// ×6/×8 grants 0.48–0.64 s per token), so an under-EOS runaway could babble to ~5×
+    /// the line length before being cut — observed in typeup dictation readback
+    /// (2026-07, "last sentence turns into looped babble ~5× longer than the text").
+    /// This cap tracks expected duration instead, cutting a runaway at ~1.35× estimate.
+    static func cloneTokenCap(for text: String, sampling: SamplingConfig) -> Int {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return min(sampling.maxTokens, 96) }
+        // 單趟掃描:word = 連續 alphanumeric run(HF 的 \w+;CJK 整句是一個 run →
+        // word 估計極小、由下面的 char rate 主導;英文則 word rate 主導)。
+        var wordCount = 0
+        var charCount = 0
+        var punctuationCount = 0
+        var inWord = false
+        for scalar in trimmed.unicodeScalars {
+            if scalar.properties.isWhitespace {
+                inWord = false
+                continue
+            }
+            charCount += 1
+            let category = scalar.properties.generalCategory
+            let isWordScalar: Bool
+            switch category {
+            case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter,
+                 .otherLetter, .decimalNumber, .letterNumber, .otherNumber, .nonspacingMark:
+                isWordScalar = true
+            case .connectorPunctuation:  // _ 屬 \w
+                isWordScalar = true
+                punctuationCount += 1
+            case .openPunctuation, .closePunctuation, .dashPunctuation,
+                 .finalPunctuation, .initialPunctuation, .otherPunctuation:
+                isWordScalar = false
+                punctuationCount += 1
+            default:
+                isWordScalar = false
+            }
+            if isWordScalar {
+                if !inWord { wordCount += 1 }
+                inWord = true
+            } else {
+                inWord = false
+            }
+        }
+        let wordSeconds = Double(wordCount) / 2.6
+        let charSeconds = Double(charCount) / 14.0
+        let estimatedSeconds = max(wordSeconds, charSeconds) + Double(punctuationCount) * 0.5 + 1.0
+        let estimatedTokens = Int((estimatedSeconds * 12.5 * 1.35).rounded(.up))
+        return min(sampling.maxTokens, max(96, estimatedTokens))
+    }
+
     /// Predict 15 remaining codebook tokens for B items at a single timestep.
     private func predictCodebooksForTimestepBatch(
         hiddenStates: MLXArray,
@@ -1334,7 +1487,10 @@ public class Qwen3TTSModel {
     /// ```
     private func buildPrefillEmbeddings(
         textTokens: [Int], codecPrefixTokens: [Int32], instructTokens: [Int]? = nil,
-        speakerEmbedding: MLXArray? = nil
+        speakerEmbedding: MLXArray? = nil,
+        // 注入點 = think_eos 之後。think layout(含 lang token)= 4;
+        // nothink layout("auto",無 lang token)= 3。對齊 ICL prefill part 6 的兩種 layout。
+        speakerInjectIndex: Int = 4
     ) -> (prefillEmbeds: MLXArray, trailingTextHidden: MLXArray, ttsPadEmbed: MLXArray) {
         let hiddenSize = config.talker.hiddenSize
 
@@ -1350,9 +1506,9 @@ public class Qwen3TTSModel {
         // Python: cat([codec_embed[:,:4,:], speaker_embed.view(1,1,-1), codec_embed[:,4:,:]])
         if let spkEmbed = speakerEmbedding {
             let spkEmbedReshaped = spkEmbed.reshaped([1, 1, hiddenSize])  // [1, 1, 1024]
-            let part0 = codecEmbeds[0..., 0..<4, 0...]  // [think, think_bos, lang, think_eos]
-            let part1 = codecEmbeds[0..., 4..., 0...]    // [pad, bos]
-            codecEmbeds = concatenated([part0, spkEmbedReshaped, part1], axis: 1)  // [1, 7, 1024]
+            let part0 = codecEmbeds[0..., 0..<speakerInjectIndex, 0...]  // [... think_eos]
+            let part1 = codecEmbeds[0..., speakerInjectIndex..., 0...]   // [pad, bos]
+            codecEmbeds = concatenated([part0, spkEmbedReshaped, part1], axis: 1)
         }
 
         // TTS special token embeddings (text-side)

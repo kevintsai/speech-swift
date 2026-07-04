@@ -126,9 +126,10 @@ extension Qwen3TTSModel {
         if iclSampling.temperature > 0 && iclSampling.repetitionPenalty < 1.5 {
             iclSampling.repetitionPenalty = 1.5
         }
-        let targetTokenCount = tokenizer.encode(text).count
-        let textDerivedCap = max(96, targetTokenCount * 8)
-        iclSampling.maxTokens = min(iclSampling.maxTokens, textDerivedCap)
+        // Duration-based cap (see cloneTokenCap): the old per-BPE-token ×8 allowed ~7×
+        // natural Chinese speech rate — runaway babble could quintuple the line before
+        // hitting it. Now cut at ~1.35× the estimated natural duration.
+        iclSampling.maxTokens = Self.cloneTokenCap(for: text, sampling: iclSampling)
         let safeMaxTokens = iclSampling.maxTokens
 
         // Reference codec as [[Int32]] (per code group) for decoder left-context.

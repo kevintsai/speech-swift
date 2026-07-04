@@ -24,6 +24,38 @@ final class EOSCapTests: XCTestCase {
         let longCap = min(500, max(75, 200 * 6))  // 200 tokens
         XCTAssertEqual(longCap, 500, "Long text should be capped at maxTokens=500")
     }
+
+    // Duration-based clone cap (cloneTokenCap): the runaway-babble guard for
+    // ICL / x-vector clone paths. Estimate = max(words/2.6, chars/14) + punct*0.5s
+    // + 1s base, * 12.5 tokens/s * 1.35 margin, floor 96.
+    func testCloneTokenCapChinese70Chars() {
+        // ~70 hanzi + fullwidth punctuation = the typeup dictation-readback case that
+        // babbled to ~5x length under the old x8 cap.
+        let text = String(repeating: "這是一段用來測試的中文字", count: 6) + ",句尾。!?"
+        // chars ~76: seconds ~ 76/14 + 4*0.5 + 1 ~ 8.4 -> tokens ~ 8.4*12.5*1.35 ~ 143
+        let cap = Qwen3TTSModel.cloneTokenCap(for: text, sampling: SamplingConfig(temperature: 0.5))
+        XCTAssertGreaterThan(cap, 96, "70+ chars should exceed the floor")
+        XCTAssertLessThan(cap, 200, "old x8 cap would be ~560; duration cap must be far tighter")
+    }
+
+    func testCloneTokenCapEnglish() {
+        let text = "Please align the column headers in the dashboard table."
+        // 9 words/2.6 ~ 3.5s vs 47 chars/14 ~ 3.4s -> max 3.5 + 1 punct*0.5 + 1 ~ 5.0s
+        // -> ~84 tokens -> floor 96 applies.
+        let cap = Qwen3TTSModel.cloneTokenCap(for: text, sampling: SamplingConfig(temperature: 0.5))
+        XCTAssertEqual(cap, 96, "short English line should land on the floor")
+    }
+
+    func testCloneTokenCapEmptyAndCeiling() {
+        XCTAssertEqual(
+            Qwen3TTSModel.cloneTokenCap(for: "  ", sampling: SamplingConfig(temperature: 0.5)),
+            96, "empty text -> floor")
+        var tiny = SamplingConfig(temperature: 0.5)
+        tiny.maxTokens = 50
+        XCTAssertEqual(
+            Qwen3TTSModel.cloneTokenCap(for: "hello world", sampling: tiny),
+            50, "caller's maxTokens is still the hard ceiling")
+    }
 }
 
 // MARK: - E2E Tests

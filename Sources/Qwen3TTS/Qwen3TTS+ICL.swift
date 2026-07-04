@@ -159,12 +159,10 @@ extension Qwen3TTSModel {
         }
         // Cap maxTokens so an under-EOS runaway can't exhaust GPU memory. The
         // model generates the TARGET codec only (the reference is provided as
-        // context, not regenerated), so the budget is purely a per-target-text
-        // allowance: 8 codec frames per BPE token is a loose upper bound on
-        // natural speech rate (~12.5 fps), with a floor for very short lines.
-        let targetTokenCount = tokenizer.encode(text).count
-        let textDerivedCap = max(96, targetTokenCount * 8)
-        iclSampling.maxTokens = min(iclSampling.maxTokens, textDerivedCap)
+        // context, not regenerated). Duration-based cap (see cloneTokenCap): the
+        // old per-BPE-token ×8 allowed ~7× natural Chinese speech rate — runaway
+        // babble could quintuple the line before hitting it.
+        iclSampling.maxTokens = Self.cloneTokenCap(for: text, sampling: iclSampling)
         let (allCodebooks, numFrames) = generateWithCodePredictor(
             prefillEmbeds: prefillEmbeds,
             trailingTextHidden: trailingTextHidden,

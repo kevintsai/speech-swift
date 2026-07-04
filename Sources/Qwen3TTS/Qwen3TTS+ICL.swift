@@ -157,12 +157,15 @@ extension Qwen3TTSModel {
         if iclSampling.temperature > 0 && iclSampling.repetitionPenalty < 1.5 {
             iclSampling.repetitionPenalty = 1.5
         }
-        // Cap maxTokens so an under-EOS runaway can't exhaust GPU memory. The
-        // model generates the TARGET codec only (the reference is provided as
-        // context, not regenerated). Duration-based cap (see cloneTokenCap): the
-        // old per-BPE-token ×8 allowed ~7× natural Chinese speech rate — runaway
-        // babble could quintuple the line before hitting it.
-        iclSampling.maxTokens = Self.cloneTokenCap(for: text, sampling: iclSampling)
+        // Cap maxTokens so an under-EOS runaway can't exhaust GPU memory.
+        // 預算 = T_ref + 目標時長估計:buildICLPrefillEmbeddings 用 streaming overlay
+        // layout,model 會先重唸參考 ~T_ref frames 才唸目標(part 5 註解;之後由 trim
+        // 剪掉)。cap 只算目標時長會切在重唸階段(2026-07-05 streaming 路徑實測踩到,
+        // blocking 同一個 prefill builder → 同樣補)。runaway 仍被 ~1.35× 目標估計封頂。
+        let refReproFrames = refCodes.dim(2)
+        iclSampling.maxTokens = min(
+            iclSampling.maxTokens,
+            refReproFrames + Self.cloneTokenCap(for: text, sampling: iclSampling))
         let (allCodebooks, numFrames) = generateWithCodePredictor(
             prefillEmbeds: prefillEmbeds,
             trailingTextHidden: trailingTextHidden,

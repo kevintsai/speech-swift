@@ -247,11 +247,10 @@ public class Qwen3TTSModel {
         let t1 = CFAbsoluteTimeGetCurrent()
 
         // Stage 3: Autoregressive generation with per-step code predictor
-        // Cap max tokens based on text length to prevent EOS failure on short texts.
-        // At 12.5 Hz codec rate, ~3-5 codec tokens per text token is typical.
-        // Factor of 6 gives ~50% margin for slow speech / pauses.
+        // Clone 路徑用 duration-based cap(見 cloneTokenCap;2026-07-05 診斷:舊 ×6 cap 下
+        // xvec 長中文句 under-EOS 跑到 19.3s vs 期望 8.4s 才被切)。
         var cappedSampling = sampling
-        cappedSampling.maxTokens = maxTokenCap(for: [text], tokenizer: tokenizer, sampling: sampling)
+        cappedSampling.maxTokens = Self.cloneTokenCap(for: text, sampling: sampling)
 
         let (allCodebooks, numFrames) = generateWithCodePredictor(
             prefillEmbeds: prefillEmbeds,
@@ -412,38 +411,32 @@ public class Qwen3TTSModel {
         let trailingTextHidden: MLXArray
         let ttsPadEmbed: MLXArray
         if let spkEmbed = speakerEmbedding {
-            // x-vector clone:prompt layout 對齊 blocking synthesizeWithVoiceClone +
-            // ICL prefill part 6 的兩種 codec prefix(有 lang id = think / auto = nothink)。
-            let langId: Int? = {
+            // x-vector clone:prompt layout **完全對齊 blocking synthesizeWithVoiceClone**
+            // (think layout + 明確 languageId + speaker 注入在 think_eos 後)。
+            // ⚠ 不用 nothink/auto layout:x-vector 注入只在 think layout 訓練分佈內,
+            // nothink + xvec 實測輸出整段雜訊(2026-07-05)。"auto" → 從文字判 CJK
+            // 解析成 chinese / english(blocking 的 fallback 也是 english)。
+            let resolvedLanguage: String = {
                 let normalized = language.lowercased()
-                if normalized == "auto" || normalized.isEmpty { return nil }
-                return CodecTokens.languageId(for: language)  // unknown → auto,不 fail
+                if normalized != "auto" && !normalized.isEmpty,
+                   CodecTokens.languageId(for: language) != nil {
+                    return normalized
+                }
+                let hasCJK = text.unicodeScalars.contains { $0.value >= 0x4E00 && $0.value <= 0x9FFF }
+                return hasCJK ? "chinese" : "english"
             }()
-            let codecPrefixTokens: [Int32]
-            let speakerInjectIndex: Int
-            if let langId = langId {
-                codecPrefixTokens = [
-                    Int32(CodecTokens.codecThink),
-                    Int32(CodecTokens.codecThinkBos),
-                    Int32(langId),
-                    Int32(CodecTokens.codecThinkEos),
-                    Int32(CodecTokens.codecPad),
-                    Int32(CodecTokens.codecBos),
-                ]
-                speakerInjectIndex = 4
-            } else {
-                codecPrefixTokens = [
-                    Int32(CodecTokens.codecNothink),
-                    Int32(CodecTokens.codecThinkBos),
-                    Int32(CodecTokens.codecThinkEos),
-                    Int32(CodecTokens.codecPad),
-                    Int32(CodecTokens.codecBos),
-                ]
-                speakerInjectIndex = 3
-            }
+            let langId = CodecTokens.languageId(for: resolvedLanguage) ?? CodecTokens.languageEnglish
+            let codecPrefixTokens: [Int32] = [
+                Int32(CodecTokens.codecThink),
+                Int32(CodecTokens.codecThinkBos),
+                Int32(langId),
+                Int32(CodecTokens.codecThinkEos),
+                Int32(CodecTokens.codecPad),
+                Int32(CodecTokens.codecBos),
+            ]
             (prefillEmbeds, trailingTextHidden, ttsPadEmbed) = buildPrefillEmbeddings(
                 textTokens: textTokens, codecPrefixTokens: codecPrefixTokens,
-                speakerEmbedding: spkEmbed, speakerInjectIndex: speakerInjectIndex)
+                speakerEmbedding: spkEmbed, speakerInjectIndex: 4)
             // Clone 路徑用 duration-based cap(見 cloneTokenCap:防 under-EOS runaway)。
             cappedSampling.maxTokens = Self.cloneTokenCap(for: text, sampling: sampling)
         } else {

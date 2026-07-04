@@ -126,10 +126,15 @@ extension Qwen3TTSModel {
         if iclSampling.temperature > 0 && iclSampling.repetitionPenalty < 1.5 {
             iclSampling.repetitionPenalty = 1.5
         }
-        // Duration-based cap (see cloneTokenCap): the old per-BPE-token ×8 allowed ~7×
-        // natural Chinese speech rate — runaway babble could quintuple the line before
-        // hitting it. Now cut at ~1.35× the estimated natural duration.
-        iclSampling.maxTokens = Self.cloneTokenCap(for: text, sampling: iclSampling)
+        // Duration-based cap(見 cloneTokenCap)+ **參考重唸預算**:ICL 的 streaming overlay
+        // layout 下,model 會先把參考重唸 ~T_ref frames 才唸目標(見 buildICLPrefillEmbeddings
+        // part 5 註解;frame-based trim 把重唸段剪掉)。cap 若只算目標時長,會在還在重唸參考
+        // 的階段就切斷 → 輸出只剩幾個字碎片/反覆(2026-07-05 實測踩到)。
+        // 所以預算 = T_ref(重唸)+ 目標時長估計(runaway 仍被 ~1.35× 目標估計封頂)。
+        let refReproFrames = refCodes.dim(2)
+        iclSampling.maxTokens = min(
+            iclSampling.maxTokens,
+            refReproFrames + Self.cloneTokenCap(for: text, sampling: iclSampling))
         let safeMaxTokens = iclSampling.maxTokens
 
         // Reference codec as [[Int32]] (per code group) for decoder left-context.

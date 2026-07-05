@@ -13,16 +13,28 @@ public struct SamplingConfig: Sendable {
     /// Positive values make the model more likely to stop. Useful for CustomVoice
     /// models that under-score EOS for certain languages.
     public var eosLogitBias: Float = 0.0
+    /// Repetition penalty context window in codec frames (mirrors mlx-lm's
+    /// `repetition_context_size`). 0 = penalize the FULL generation history.
+    ///
+    /// Why a window exists: the penalty divides the logits of every unique token ever
+    /// generated while the EOS logit stays protected. Over a long utterance the penalized
+    /// set only grows, so EOS gains a cumulative relative advantage — with syllable-
+    /// repetitive text (long Chinese numbers: 三/百/十…) the model stops early, clipping
+    /// the last word(s). A window bounds the penalized set to recent frames: repetition
+    /// loops (period well under a couple of seconds) are still suppressed, but tokens
+    /// spoken long ago no longer starve the tail of the sentence.
+    public var repetitionContextSize: Int = 0
 
     public init() {}
 
-    public init(temperature: Float, topK: Int = 50, topP: Float = 1.0, repetitionPenalty: Float = 1.05, maxTokens: Int = 4096, eosLogitBias: Float = 0.0) {
+    public init(temperature: Float, topK: Int = 50, topP: Float = 1.0, repetitionPenalty: Float = 1.05, maxTokens: Int = 4096, eosLogitBias: Float = 0.0, repetitionContextSize: Int = 0) {
         self.temperature = temperature
         self.topK = topK
         self.topP = topP
         self.repetitionPenalty = repetitionPenalty
         self.maxTokens = maxTokens
         self.eosLogitBias = eosLogitBias
+        self.repetitionContextSize = repetitionContextSize
     }
 
     public static var `default`: SamplingConfig { SamplingConfig() }
@@ -59,9 +71,12 @@ public func sampleToken(
         logits = MLX.where(suppressMask, MLXArray(Float(-1e9)), logits)
     }
 
-    // 2. Repetition penalty
+    // 2. Repetition penalty (windowed when repetitionContextSize > 0 — see SamplingConfig)
     if config.repetitionPenalty != 1.0 && !generatedTokens.isEmpty {
-        let uniqueTokens = Array(Set(generatedTokens))
+        let contextTokens = config.repetitionContextSize > 0
+            ? Array(generatedTokens.suffix(config.repetitionContextSize))
+            : generatedTokens
+        let uniqueTokens = Array(Set(contextTokens))
         let indices = MLXArray(0..<Int32(vocabSize))
         var penaltyMask = indices .== Int32(-1)  // all false
         for token in uniqueTokens {

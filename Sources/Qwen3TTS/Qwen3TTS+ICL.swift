@@ -157,6 +157,12 @@ extension Qwen3TTSModel {
         if iclSampling.temperature > 0 && iclSampling.repetitionPenalty < 1.5 {
             iclSampling.repetitionPenalty = 1.5
         }
+        // Windowed repetition penalty — same rationale and default as the streaming ICL
+        // path (see Qwen3TTS+ICLStreaming.swift): full-history penalty + protected EOS
+        // clips the tail of syllable-repetitive lines (long Chinese numbers).
+        if iclSampling.repetitionContextSize <= 0 {
+            iclSampling.repetitionContextSize = 25
+        }
         // Cap maxTokens so an under-EOS runaway can't exhaust GPU memory.
         // 預算 = T_ref + 目標時長估計:buildICLPrefillEmbeddings 用 streaming overlay
         // layout,model 會先重唸參考 ~T_ref frames 才唸目標(part 5 註解;之後由 trim

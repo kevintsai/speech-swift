@@ -126,6 +126,17 @@ extension Qwen3TTSModel {
         if iclSampling.temperature > 0 && iclSampling.repetitionPenalty < 1.5 {
             iclSampling.repetitionPenalty = 1.5
         }
+        // Windowed repetition penalty (default 25 frames = 2 s unless the caller already set
+        // one). With the 1.5 penalty over the FULL history, syllable-repetitive lines (long
+        // Chinese numbers) saturate the penalized set toward the end of the sentence while
+        // EOS stays protected → early EOS clips the last word(s)(2026-07-06 typeup 實測:
+        // gao_yulin ref +「…八千三百三十六。」尾字「三十六」被吃,deterministic repro;
+        // window 50 仍吃掉最後一字「六」,25/12 完整還原 → 取 25)。25 frames still covers
+        // repetition-loop periods (babble loops repeat well under 2 s), so the anti-runaway
+        // intent of the 1.5 bump keeps working.
+        if iclSampling.repetitionContextSize <= 0 {
+            iclSampling.repetitionContextSize = 25
+        }
         // Duration-based cap(見 cloneTokenCap)+ **參考重唸預算**:ICL 的 streaming overlay
         // layout 下,model 會先把參考重唸 ~T_ref frames 才唸目標(見 buildICLPrefillEmbeddings
         // part 5 註解;frame-based trim 把重唸段剪掉)。cap 若只算目標時長,會在還在重唸參考
